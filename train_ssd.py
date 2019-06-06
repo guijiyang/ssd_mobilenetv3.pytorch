@@ -1,3 +1,4 @@
+# %%
 from __future__ import division
 import torch.nn.functional as F
 import torch
@@ -43,8 +44,8 @@ def point_form_box(boxes):
         boxes: (tensor) boxes with left_top point and right_bottom point formation
     """
     bounding = torch.cat(
-        (boxes[:, :2]-boxes[:, 2:]/2, boxes[:, 2:]+boxes[:, 2:]/2), dim=1)
-    # bounding.clamp_(max=1, min=0)
+        (boxes[:, :2]-boxes[:, 2:]/2, boxes[:, :2]+boxes[:, 2:]/2), dim=1)
+    bounding.clamp_(max=1, min=0)
     return bounding
 
 
@@ -665,35 +666,51 @@ def mobilenetv3_small(**kwargs):
 
     return MobileNetV3(cfgs, mode='small', **kwargs)
 
-
-# for making bounding boxes pretty
-COLORS = ((255, 0, 0, 128), (0, 255, 0, 128), (0, 0, 255, 128),
-          (0, 255, 255, 128), (255, 0, 255, 128), (255, 255, 0, 128))
-
 MEANS = (104, 117, 123)
 
-# SSD256 CONFIGS
+# SSD512 CONFIGS
 voc_config = {
     'num_classes': 21,
     'lr_steps': (80000, 100000, 120000),
     'max_iter': 120000,
-    'feature_maps': [64, 32, 16, 8, 4, 2, 1],
-    'steps': [4, 8, 16, 32, 64, 128, 256],
-    'min_dim': 256,
-    'size_scale': [0.06, 0.94],
-    'aspect_ratios': [[2], [2, 3], [2, 3], [2, 3], [2], [2], [2]],
+    # 'feature_maps': [64, 32, 16, 8, 4, 2, 1],
+    # 'steps': [4, 8, 16, 32, 64, 128, 256],
+    # 'min_sizes': [9.0, 25.6, 51.2, 94.7, 138.2, 200.0, 225.3],
+    # 'max_sizes': [25.6, 51.2, 94.7, 138.2, 200.0, 225.3, 268.8],
+    # 'min_sizes': [20, 30, 60, 111, 162, 182, 225],
+    # 'max_sizes': [30, 60, 111, 162, 182, 225, 269],
+    # 'feature_maps': [76, 38, 19, 10, 5, 3, 1],
+    # 'steps': [4, 8, 16, 32, 64, 100, 300],
+    # 'min_sizes': [20, 30, 60, 111, 162, 213, 264],
+    # 'max_sizes': [30, 60, 111, 162, 213, 264, 315],
+    'min_dim': 512,
+    'feature_maps': [128, 64, 32, 16, 8, 4, 2, 1],
+    'steps': [4, 8, 16, 32, 64, 128, 256, 512],
+    # 'scales': [16, 32, 64, 128, 188, 280, 390, 512],
+    'min_sizes': [10.0, 35.84, 76.8, 133.6, 230.4, 307.2, 384.0, 460.8],
+    'max_sizes': [35.84, 76.8, 133.6, 230.4, 307.2, 384.0, 460.8, 537.6],
+    # 'min_sizes': [20, 30, 60, 111, 162, 182, 225],
+    # 'max_sizes': [30, 60, 111, 162, 182, 225, 269],
+    'size_scale': [0.05, 0.95],
+    'aspect_ratios': {
+        '256': [[2], [2], [2, 3], [2, 3], [2, 3], [2], [2]],
+        '512': [[2, 3], [2, 3], [2, 3], [2, 3], [2, 3], [2, 3], [2], [2]]
+    },
+    # 'ratios': [0.33, 0.5, 1, 2, 3],
     'variance': [0.1, 0.2],
     'clip': True,
     'name': 'VOC',
     'TOP_DOWN_PYRAMID_SIZE': 256,
     'extras': {
         '256': [256, 128, 128],
+        '512': [256, 128, 128, 128],
     },
     'net_source': [1, 3, 7, 11],
     'mbox': {
         # number of boxes per feature map location
-        '256': [4, 6, 6, 6, 4, 4, 4],
-    },
+        '256': [4, 4, 6, 6, 6, 4, 4],
+        '512': [6, 6, 6, 6, 6, 6, 4, 4],
+    }
 }
 
 coco_config = {
@@ -706,6 +723,7 @@ coco_config = {
     'min_sizes': [21, 45, 99, 153, 207, 261],
     'max_sizes': [45, 99, 153, 207, 261, 315],
     'aspect_ratios': [[2], [2, 3], [2, 3], [2, 3], [2], [2]],
+    'ratios': [0.5, 1, 2],
     'variance': [0.1, 0.2],
     'clip': True,
     'name': 'COCO',
@@ -779,14 +797,12 @@ class PriorBox(object):
     def __init__(self, cfg):
         super(PriorBox, self).__init__()
         self.image_size = cfg['min_dim']
-        # number of priors for feature map location (either 4 or 6)
-        self.num_priors = len(cfg['aspect_ratios'])
         self.variance = cfg['variance'] or [0.1]
         self.feature_maps = cfg['feature_maps']
-        self.size_scale = cfg['size_scale']
-        self.min_sizes, self.max_sizes = self.calc_size()
+        self.min_sizes = cfg['min_sizes']
+        self.max_sizes = cfg['max_sizes']
         self.steps = cfg['steps']
-        self.aspect_ratios = cfg['aspect_ratios']
+        self.aspect_ratios = cfg['aspect_ratios'][str(self.image_size)]
         self.clip = cfg['clip']
         self.version = cfg['name']
         for v in self.variance:
@@ -818,20 +834,52 @@ class PriorBox(object):
                     mean += [cx, cy, s_k/sqrt(ar), s_k*sqrt(ar)]
         # back to torch land
         output = torch.tensor(mean, requires_grad=False).view(-1, 4)
+        # anchors = []
+        # for i, f in enumerate(self.feature_maps):
+        #     # Get all combinations of scales and ratios
+        #     scales, ratios = np.meshgrid(self.scales[i], self.ratios)
+        #     scales = scales.flatten()
+        #     ratios = ratios.flatten()
+        #     # Enumerate heights and widths from scales and ratios
+        #     widths = scales/np.sqrt(ratios)
+        #     heights = scales*np.sqrt(ratios)
+        #     # Enumerate shifts in feature space
+        #     shifts_x = shifts_y = np.arange(0, f)*self.steps[i]
+        #     shifts_x, shifts_y = np.meshgrid(shifts_x, shifts_y)
+        #     # Enumerate combinations of shifts, widths, and heights
+        #     box_widths, box_centers_x = np.meshgrid(widths, shifts_x)
+        #     box_heights, box_centers_y = np.meshgrid(heights, shifts_y)
+        #     # Reshape to get a list of (y, x) and a list of (h, w)
+        #     box_centers = np.stack(
+        #         [box_centers_x, box_centers_y], axis=2).reshape([-1, 2])
+        #     box_sizes = np.stack([box_widths, box_heights],
+        #                          axis=2).reshape([-1, 2])
+        #     boxes = np.concatenate([box_centers, box_sizes], axis=1)
+        #     # # Convert to corner coordinates (y1, x1, y2, x2)
+        #     # boxes = np.concatenate([box_centers - 0.5 * box_sizes,
+        #     #                         box_centers + 0.5 * box_sizes], axis=1)
+        #     scale = np.array([self.image_size - 1, self.image_size - 1,
+        #                       self.image_size - 1, self.image_size - 1])
+        #     shift = np.array([0, 0, 1, 1])
+        #     norm_boxes = np.divide((boxes - shift), scale).astype(np.float32)
+        #     anchors.append(norm_boxes)
+        # anchors = np.concatenate(anchors, axis=0)
+        # output = torch.Tensor(anchors)
         if self.clip:
             output.clamp_(max=1, min=0)
         return output
 
-    def calc_size(self):
-        """ calculate min_size and max_size of special feature map """
-        min_size = []
-        max_size = []
-        for k in range(1, len(self.feature_maps)+1):
-            min_size.append(math.floor(
-                self.image_size*(self.size_scale[0]+(self.size_scale[1]-self.size_scale[0])*(k-1)/6)))
-            max_size.append(math.ceil(
-                self.image_size*(self.size_scale[0]+(self.size_scale[1]-self.size_scale[0])*k/6)))
-        return min_size, max_size
+    # def calc_size(self):
+    #     """ calculate min_size and max_size of special feature map """
+    #     min_size = []
+    #     max_size = []
+    #     m = len(self.feature_maps)
+    #     for k in range(0, m):
+    #         min_size.append(math.floor(
+    #             self.image_size*(self.size_scale[0]+(self.size_scale[1]-self.size_scale[0])*k/(m-1))))
+    #         max_size.append(math.ceil(
+    #             self.image_size*(self.size_scale[0]+(self.size_scale[1]-self.size_scale[0])*(k+1)/(m-1))))
+    #     return min_size, max_size
 
 
 # %%
@@ -1049,11 +1097,14 @@ class SSD(nn.Module):
                                       * num_classes, kernel_size=3, padding=1)]
         return nn.ModuleList(mobile_layers), nn.ModuleList(extra_layers), \
             nn.ModuleList(loc_layers), nn.ModuleList(conf_layers)
-        
+
     def to_cuda(self):
-        self.priors=self.priors.cuda()
+        self.priors = self.priors.cuda()
         self.cuda()
         return self
+
+    def get_prior(self):
+        return self.priors
 
 # %%
 
@@ -1451,7 +1502,7 @@ class PhotometricDistort(object):
 
 
 class SSDAugmentation(object):
-    def __init__(self, size=256, mean=(104, 117, 123)):
+    def __init__(self, size=voc_config['min_dim'], mean=MEANS):
         self.mean = mean
         self.size = size
         self.augment = Compose([
@@ -1492,10 +1543,11 @@ class VOCDataset(data.Dataset):
     """
 
     def __init__(self, dataset_dir, transform=None, mode='train', datasets=['VOC2007', 'VOC2012'],
-                 include_difficult=True, class_to_ind=None):
+                 keep_difficult=True, class_to_ind=None):
         self.dataset_dir = dataset_dir
         self.datasets = datasets
         self.transform = transform
+        self.keep_difficult = keep_difficult
         self.image_info = []
         self.name = 'VOC'
         self.class_to_ind = class_to_ind or dict(
@@ -1515,7 +1567,7 @@ class VOCDataset(data.Dataset):
         return len(self.image_info)
 
     def __getitem__(self, index):
-        _, image, gt_boxes = self.get_data(index)
+        _, image, gt_boxes, _, _ = self.get_data(index)
         return image, gt_boxes
 
     def get_data(self, index):
@@ -1539,14 +1591,16 @@ class VOCDataset(data.Dataset):
         bboxes = []
         labels = []
         for elem in tree.iter('object'):
-
-            #     box=[]
+            difficult = int(elem.find('difficult').text) == 1
+            if not self.keep_difficult and difficult:
+                continue
             bndbox = elem.find('bndbox')
             pts = ['xmin', 'ymin', 'xmax', 'ymax']
             for idx, pt in enumerate(pts):
                 bboxes.append((int(bndbox.find(pt).text)-1) /
                               (width if idx % 2 == 0 else height))
-            labels.append(self.class_to_ind[elem.find('name').text])
+            label_name = elem.find('name').text
+            labels.append(self.class_to_ind[label_name])
         bboxes = np.array(bboxes, dtype=np.float32).reshape(-1, 4)
         labels = np.array(labels).reshape(-1, 1)
         if self.transform:
@@ -1750,11 +1804,11 @@ def train(dataset_name, basenet, batch_size, num_workers, cuda, lr, weight_decay
     if dataset_name == 'VOC':
         cfg = voc_config
         dataset = VOCDataset(DATA_DIR, transform=SSDAugmentation(
-            cfg['min_dim'], (104, 117, 123)))
+            cfg['min_dim'], MEANS), keep_difficult=False)
     elif dataset_name == 'COCO':
         cfg = coco_config
         dataset = COCODataset(DATA_DIR, transform=SSDAugmentation(
-            cfg['min_dim'], (104, 117, 123)))
+            cfg['min_dim'], MEANS))
 
     if visdom:
         import visdom
@@ -1873,9 +1927,9 @@ def train(dataset_name, basenet, batch_size, num_workers, cuda, lr, weight_decay
         #     images=torch.tensor(images)
         #     targets=torch.tensor(targets)
         # forward
-        out = net(images)
         # backprop
         optimizer.zero_grad()
+        out = net(images)
         loss_l, loss_c = criterion(out, targets)
         loss = loss_l + loss_c
         loss.backward()
@@ -1905,50 +1959,158 @@ def train(dataset_name, basenet, batch_size, num_workers, cuda, lr, weight_decay
                save_folder + 'ssd224_VOC.pth')
 
 
+# %%
 if __name__ == "__main__":
-    # args = {}
-    # args['dataset_name'] = 'VOC'
-    # args['basenet'] = 'mobilenetv3_small'
-    # args['batch_size'] = 32
+
+    # 这部分代码用于训练
+    args = {}
+    args['dataset_name'] = 'VOC'
+    args['basenet'] = 'mobilenetv3_small'
+    args['batch_size'] = 32
     # args['resume'] = './pretrained/ssd224_VOC_60000.pth'
     # args['start_iter'] = int(re.findall(
     #     r'[1-9]\d+\.?[0-9]\d*', args['resume'])[-1])
-    # args['num_workers'] = 4
-    # args['cuda'] = False
-    # args['lr'] = 1e-3
-    # args['weight_decay'] = 5e-4
-    # args['gamma'] = 0.1
-    # args['visdom'] = False
-    # args['save_folder'] = 'weights/'
+    args['resume'] = None
+    args['start_iter'] = 0
+    args['num_workers'] = 4
+    args['cuda'] = False
+    args['lr'] = 1e-3
+    args['weight_decay'] = 5e-4
+    args['gamma'] = 0.1
+    args['visdom'] = False
+    args['save_folder'] = './trained'
 
-    # train(**args)
+    train(**args)
 
-    dataset = VOCDataset(DATA_DIR, Compose([ConvertFromInts(), Resize(
-        voc_config['min_dim']), SubtractMeans((104, 117, 123))]))
-    idx = np.random.randint(len(dataset))
-    image_id, image, gt_bboxes, width, height = dataset.get_data(idx)
+    # #　训练结束后测试效果
+    # dataset = VOCDataset(DATA_DIR, Compose([ConvertFromInts(), Resize(
+    #     voc_config['min_dim']), SubtractMeans(MEANS)]))
+    # idx = np.random.randint(len(dataset))
+    # image_id, image, gt_bboxes, width, height = dataset.get_data(idx)
+    # model = SSD('test', 'mobilenetv3_small',
+    #             voc_config['min_dim'], voc_config['num_classes'])
+    # model.load_weights('./pretrained/ssd224_VOC_60000.pth')
+    # model = model.to_cuda()
+    # model.eval()
+    # with torch.no_grad():
+    #     detections = model(image.view((1,)+image.shape).cuda()).data
+
+    # # skip j = 0, because it's the background class
+    # for j in range(1, detections.size(1)):
+    #     dets = detections[0, j, :]
+    #     mask = dets[:, 0].gt(0.6).expand(5, dets.size(0)).t()
+    #     dets = torch.masked_select(dets, mask).view(-1, 5)
+    #     if dets.size(0) == 0:
+    #         continue
+    #     boxes = dets[:, 1:]
+    #     boxes[:, 0] *= width
+    #     boxes[:, 2] *= width
+    #     boxes[:, 1] *= height
+    #     boxes[:, 3] *= height
+    #     scores = dets[:, 0].cpu().numpy()
+    #     cls_dets = np.hstack((boxes.cpu().numpy(),
+    #                           scores[:, np.newaxis])).astype(np.float32,
+    #                                                          copy=False)
+    #     print(cls_dets.shape)
+
+    # voc_config = {
+    #     'num_classes': 21,
+    #     'lr_steps': (80000, 100000, 120000),
+    #     'max_iter': 120000,
+    #     'feature_maps': [38, 19, 10, 5, 3, 1],
+    #     'steps': [8, 16, 32, 64, 100, 300],
+    #     'min_sizes': [30, 60, 111, 162, 213, 264],
+    #     'max_sizes': [60, 111, 162, 213, 264, 315],
+    #     'min_dim': 300,
+    #     'aspect_ratios': {
+    #         '300': [[2], [2, 3], [2, 3], [2, 3], [2], [2]],
+    #     },
+    #     # 'ratios': [0.33, 0.5, 1, 2, 3],
+    #     'variance': [0.1, 0.2],
+    #     'clip': True,
+    #     'name': 'VOC',
+    #     'TOP_DOWN_PYRAMID_SIZE': 256,
+    #     'extras': {
+    #         '300': [256, 128, 128],
+    #     },
+    #     'net_source': [1, 3, 7, 11],
+    #     'mbox': {
+    #         # number of boxes per feature map location
+    #         '300': [4, 6, 6, 6, 4, 4],
+    #     }
+    # }
+
+    # dataset = VOCDataset(DATA_DIR, Compose([ConvertFromInts(), Resize(
+    #     voc_config['min_dim']), SubtractMeans(MEANS)]), keep_difficult=False)
+
+    dataset = VOCDataset(DATA_DIR, transform=SSDAugmentation(
+        voc_config['min_dim'], MEANS), keep_difficult=False)
+    data_loader = data.DataLoader(
+        dataset, 32, shuffle=True, collate_fn=detection_collate, pin_memory=True)
     model = SSD('test', 'mobilenetv3_small',
                 voc_config['min_dim'], voc_config['num_classes'])
-    model.load_weights('./pretrained/ssd224_VOC_60000.pth')
-    model = model.to_cuda()
-    model.eval()
-    with torch.no_grad():
-        detections = model(image.view((1,)+image.shape).cuda()).data
+    batch_iterator = iter(data_loader)
+    priorbox = PriorBox(voc_config)
+    priors = priorbox.forward()
+    # num=5
+    # num_priors = (priors.size(0))
+    # loc_t = torch.Tensor(num, num_priors, 4)
+    # conf_t = torch.LongTensor(num, num_priors)
+    # total = 0
+    # sizes=np.array([]).reshape(-1,2)
+    # # for iteration in range(1, 10):
+    #     # images, targets = next(batch_iterator)
+    # for idx in range(num):
+    #     _,_, targets, height, width=dataset.get_data(idx)
+    #     # print(targets)
+    #     truths = torch.from_numpy(targets[:, :-1]).float()
+    #     labels = torch.from_numpy(targets[:, -1]).float()
+    #     defaults = priors.data
+    #     match(0.5, truths, defaults,
+    #             voc_config['variance'], labels, loc_t, conf_t, idx)
 
-    # skip j = 0, because it's the background class
-    for j in range(1, detections.size(1)):
-        dets = detections[0, j, :]
-        mask = dets[:, 0].gt(0.6).expand(5, dets.size(0)).t()
-        dets = torch.masked_select(dets, mask).view(-1, 5)
-        if dets.size(0) == 0:
-            continue
-        boxes = dets[:, 1:]
-        boxes[:, 0] *= width
-        boxes[:, 2] *= width
-        boxes[:, 1] *= height
-        boxes[:, 3] *= height
-        scores = dets[:, 0].cpu().numpy()
-        cls_dets = np.hstack((boxes.cpu().numpy(),
-                              scores[:, np.newaxis])).astype(np.float32,
-                                                             copy=False)
-        print(cls_dets.shape)
+    # pos = conf_t > 0
+    # num_pos = pos.sum(dim=1, keepdim=True)
+    # print(num_pos)
+    # match priors (default boxes) and ground truth boxes
+    num = 32
+    num_priors = (priors.size(0))
+    loc_t = torch.Tensor(num, num_priors, 4)
+    conf_t = torch.LongTensor(num, num_priors)
+    total = 0
+    sizes = np.array([]).reshape(-1, 2)
+    for iteration in range(1, 50):
+        images, targets = next(batch_iterator)
+        for idx in range(num):
+            truths = targets[idx][:, :-1].data
+            labels = targets[idx][:, -1].data
+            defaults = priors.data
+            match(0.5, truths, defaults,
+                  voc_config['variance'], labels, loc_t, conf_t, idx)
+
+        pos = conf_t > 0
+        num_pos = pos.sum(dim=1, keepdim=True)
+        p = num_pos == 1
+        idx = np.nonzero(p)
+        for i in idx:
+            box = targets[i[0]]
+            size = (box[:, 2:4]-box[:, :2])*voc_config['min_dim']
+            sizes = np.concatenate(
+                [sizes, size.numpy().reshape(-1, 2)], axis=0)
+            # print(size)
+        # poor=targets[idx[:,0].item()]
+        total += p.sum()
+    print(total)
+    # print(sizes)
+    # sizes=np.array(sizes).reshape(-1,2)
+    print(sizes.sum(axis=0)/sizes.shape[0])
+
+# %%
+    fig = plt.figure(figsize=(16, 16))
+    plt.scatter(sizes[:, 0], sizes[:, 1])
+
+# %%
+sizes.shape
+
+
+#%%
