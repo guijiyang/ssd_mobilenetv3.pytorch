@@ -1,12 +1,14 @@
 # %%
 from __future__ import division
 import torch.nn.functional as F
+from torch.autograd import Function
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torch.nn.init as init
 import torch.utils.data as data
+# from torch.utils.tensorboard import SummaryWriter
 import os
 import logging
 import types
@@ -19,7 +21,7 @@ import re
 import datetime
 import os.path
 import torchvision
-# import torchsummary
+import torchsummary
 import xml.etree.ElementTree as ET
 from numpy import random
 from torchvision import transforms
@@ -36,6 +38,48 @@ DATA_DIR = HOME+'/dataset/'
 os.chdir('/home/guijiyang/Code/python/torch/ssd')
 
 
+class Config():
+    """ Base configuration class used for VOC, For other custom configurations, create a
+    sub-class that inherits from this one and override properties
+    that need to be changed. """
+
+    name = 'VOC'
+    backbone = 'mobilenetv3_small'
+    means = (104, 117, 123)
+    num_classes = 21
+    min_dim = 512
+    feature_maps = [128, 64, 32, 16, 8, 4, 2, 1]
+    steps = [4, 8, 16, 32, 64, 128, 256, 512]
+    min_sizes = [10.0, 35.84, 76.8, 133.6, 230.4, 307.2, 384.0, 460.8]
+    max_sizes = [35.84, 76.8, 133.6, 230.4, 307.2, 384.0, 460.8, 537.6]
+    size_scale = [0.05, 0.95]
+    variance = [0.1, 0.2]
+    clip = True
+    top_down_pyramid_size = 256
+    net_source = [1, 3, 7, 11]
+    aspect_ratios = [[2, 3], [2, 3], [2, 3], [2, 3], [2, 3], [2, 3], [2], [2]]
+    extras = [256, 128, 128, 128]
+    mbox = [6, 6, 6, 6, 6, 6, 4, 4]
+    overlap_threshold = 0.5
+    negative_ratio = 3
+    with_fpn = True
+
+    def display(self):
+        """Display Configuration values."""
+        print("\nConfigurations:")
+        for a in dir(self):
+            if not a.startswith("__") and not callable(getattr(self, a)):
+                print("{:30} {}".format(a, getattr(self, a)))
+        print("\n")
+
+
+class CocoConfig(Config):
+    num_classes = 201
+    lr_steps = (280000, 360000, 400000)
+    max_iter = 400000
+    name = 'COCO'
+
+
 def point_form_box(boxes):
     """ convert center formed boxes to point formed boxes
     Arg:
@@ -47,17 +91,6 @@ def point_form_box(boxes):
         (boxes[:, :2]-boxes[:, 2:]/2, boxes[:, :2]+boxes[:, 2:]/2), dim=1)
     bounding.clamp_(max=1, min=0)
     return bounding
-
-
-def center_size(boxes):
-    """ Convert prior_boxes to (cx, cy, w, h)
-    representation for comparison to center-size form ground truth data.
-    Args:
-        boxes: (tensor) point_form boxes
-    Return:
-        boxes: (tensor) Converted xcenter, ycenter, width, height form of boxes.
-    """
-    return torch.cat(((boxes[:, :2]+boxes[:, 2:])/2, (boxes[:, :2]-boxes[:, 2:])/2), dim=1)
 
 
 def intersect(box_a, box_b):
@@ -137,7 +170,7 @@ def decode(loc, priors, variances):
     Return:
         decoded bounding box predictions
     """
-    pred_box = torch.cat((priors[:, :2]+loc[:, :2]*priors[:, 2:]*variances[0],
+    pred_box = torch.cat((priors[:, :2]+loc[:, :2]*variances[0]*priors[:, 2:],
                           priors[:, 2:]*torch.exp(loc[:, 2:]*variances[1])), dim=1)
     pred_box[:, :2] -= pred_box[:, 2:]/2
     pred_box[:, 2:] += pred_box[:, :2]
@@ -280,7 +313,7 @@ class Logger():
             log_dir, '{}{:%Y%m%dT%H%M}.log'.format(name, now))
         handler = logging.FileHandler(log_path)
         handler.setFormatter(formater)
-        console = logging.StreamHandler()
+        console = logging.StreamHandler(sys.stdout)
         console.setLevel(logging.INFO)
         self.logger.addHandler(handler)
         self.logger.addHandler(console)
@@ -383,7 +416,6 @@ Andrew Howard, Mark Sandler, Grace Chu, Liang-Chieh Chen, Bo Chen, Mingxing Tan,
 Searching for MobileNetV3
 arXiv preprint arXiv:1905.02244.
 """
-
 
 __all__ = ['mobilenetv3_large', 'mobilenetv3_small']
 
@@ -600,18 +632,8 @@ class MobileNetV3(nn.Module):
                 for idx in range(len(sequence)):
                         # conv_layers(sequence[idx])
                     layers.append(sequence[idx])
-                # for layer in sequence.named_modules():
-                #     if isinstance(layer[1], nn.Sequential):
-                #         conv_layers(layer[1])
-            # elif isinstance(sequence, InvertedResidual):
-            #         conv_layers(sequence.conv)
             else:
-                # print(sequence)
                 layers.append(sequence)
-            # print(idx, layer)
-
-        # print(len(self.features))
-        # for idx in range(len(self.features)):
         conv_layers(self.features)
         if self.include_top == True and self.visual == False:
             conv_layers(self.conv)
@@ -666,78 +688,15 @@ def mobilenetv3_small(**kwargs):
 
     return MobileNetV3(cfgs, mode='small', **kwargs)
 
-MEANS = (104, 117, 123)
 
-# SSD512 CONFIGS
-voc_config = {
-    'num_classes': 21,
-    'lr_steps': (80000, 100000, 120000),
-    'max_iter': 120000,
-    # 'feature_maps': [64, 32, 16, 8, 4, 2, 1],
-    # 'steps': [4, 8, 16, 32, 64, 128, 256],
-    # 'min_sizes': [9.0, 25.6, 51.2, 94.7, 138.2, 200.0, 225.3],
-    # 'max_sizes': [25.6, 51.2, 94.7, 138.2, 200.0, 225.3, 268.8],
-    # 'min_sizes': [20, 30, 60, 111, 162, 182, 225],
-    # 'max_sizes': [30, 60, 111, 162, 182, 225, 269],
-    # 'feature_maps': [76, 38, 19, 10, 5, 3, 1],
-    # 'steps': [4, 8, 16, 32, 64, 100, 300],
-    # 'min_sizes': [20, 30, 60, 111, 162, 213, 264],
-    # 'max_sizes': [30, 60, 111, 162, 213, 264, 315],
-    'min_dim': 512,
-    'feature_maps': [128, 64, 32, 16, 8, 4, 2, 1],
-    'steps': [4, 8, 16, 32, 64, 128, 256, 512],
-    # 'scales': [16, 32, 64, 128, 188, 280, 390, 512],
-    'min_sizes': [10.0, 35.84, 76.8, 133.6, 230.4, 307.2, 384.0, 460.8],
-    'max_sizes': [35.84, 76.8, 133.6, 230.4, 307.2, 384.0, 460.8, 537.6],
-    # 'min_sizes': [20, 30, 60, 111, 162, 182, 225],
-    # 'max_sizes': [30, 60, 111, 162, 182, 225, 269],
-    'size_scale': [0.05, 0.95],
-    'aspect_ratios': {
-        '256': [[2], [2], [2, 3], [2, 3], [2, 3], [2], [2]],
-        '512': [[2, 3], [2, 3], [2, 3], [2, 3], [2, 3], [2, 3], [2], [2]]
-    },
-    # 'ratios': [0.33, 0.5, 1, 2, 3],
-    'variance': [0.1, 0.2],
-    'clip': True,
-    'name': 'VOC',
-    'TOP_DOWN_PYRAMID_SIZE': 256,
-    'extras': {
-        '256': [256, 128, 128],
-        '512': [256, 128, 128, 128],
-    },
-    'net_source': [1, 3, 7, 11],
-    'mbox': {
-        # number of boxes per feature map location
-        '256': [4, 4, 6, 6, 6, 4, 4],
-        '512': [6, 6, 6, 6, 6, 6, 4, 4],
-    }
-}
-
-coco_config = {
-    'num_classes': 201,
-    'lr_steps': (280000, 360000, 400000),
-    'max_iter': 400000,
-    'feature_maps': [38, 19, 10, 5, 3, 1],
-    'min_dim': 300,
-    'steps': [8, 16, 32, 64, 100, 300],
-    'min_sizes': [21, 45, 99, 153, 207, 261],
-    'max_sizes': [45, 99, 153, 207, 261, 315],
-    'aspect_ratios': [[2], [2, 3], [2, 3], [2, 3], [2], [2]],
-    'ratios': [0.5, 1, 2],
-    'variance': [0.1, 0.2],
-    'clip': True,
-    'name': 'COCO',
-}
-
-
-class Detect():
+class Detect(Function):
     """At test time, Detect is the final layer of SSD.  Decode location preds,
     apply non-maximum suppression to location predictions based on conf
     scores and threshold to a top_k number of output predictions for both
     confidence score and locations.
     """
 
-    def __init__(self, num_classes, bkg_label, top_k, conf_thresh, nms_thresh):
+    def __init__(self, num_classes, bkg_label, top_k, conf_thresh, nms_thresh, variance):
         self.num_classes = num_classes
         self.background_label = bkg_label
         self.top_k = top_k
@@ -746,9 +705,9 @@ class Detect():
         if nms_thresh <= 0:
             raise ValueError('nms_threshold must be non negative.')
         self.conf_thresh = conf_thresh
-        self.variance = voc_config['variance']
+        self.variance = variance
 
-    def __call__(self, loc_data, conf_data, prior_data):
+    def forward(self, loc_data, conf_data, prior_data):
         """
         Args:
             loc_data: (tensor) Loc preds from loc layers
@@ -796,15 +755,15 @@ class PriorBox(object):
 
     def __init__(self, cfg):
         super(PriorBox, self).__init__()
-        self.image_size = cfg['min_dim']
-        self.variance = cfg['variance'] or [0.1]
-        self.feature_maps = cfg['feature_maps']
-        self.min_sizes = cfg['min_sizes']
-        self.max_sizes = cfg['max_sizes']
-        self.steps = cfg['steps']
-        self.aspect_ratios = cfg['aspect_ratios'][str(self.image_size)]
-        self.clip = cfg['clip']
-        self.version = cfg['name']
+        self.image_size = cfg.min_dim
+        self.variance = cfg.variance or [0.1]
+        self.feature_maps = cfg.feature_maps
+        self.min_sizes = cfg.min_sizes
+        self.max_sizes = cfg.max_sizes
+        self.steps = cfg.steps
+        self.aspect_ratios = cfg.aspect_ratios
+        self.clip = cfg.clip
+        self.version = cfg.name
         for v in self.variance:
             if v <= 0:
                 raise ValueError('Variances must be greater than 0')
@@ -869,60 +828,40 @@ class PriorBox(object):
             output.clamp_(max=1, min=0)
         return output
 
-    # def calc_size(self):
-    #     """ calculate min_size and max_size of special feature map """
-    #     min_size = []
-    #     max_size = []
-    #     m = len(self.feature_maps)
-    #     for k in range(0, m):
-    #         min_size.append(math.floor(
-    #             self.image_size*(self.size_scale[0]+(self.size_scale[1]-self.size_scale[0])*k/(m-1))))
-    #         max_size.append(math.ceil(
-    #             self.image_size*(self.size_scale[0]+(self.size_scale[1]-self.size_scale[0])*(k+1)/(m-1))))
-    #     return min_size, max_size
-
-
-# %%
 
 class SSD(nn.Module):
     """ ssd model implementation
     Inputs:
         mode: train or test
-        backbone: backbone for base network, 'mobilenetv3_large' or 'mobilenetv3_small'
-        size: image size
-        num_classes: number of object classes 
+        config: dataset configuration
     """
 
-    def __init__(self, mode, backbone, size,  num_classes, with_fpn=True):
+    def __init__(self, mode, config):
         super(SSD, self).__init__()
 
         assert mode in ["test", "train"]
-        assert backbone in ['mobilenetv3_large', 'mobilenetv3_small']
+        assert config.backbone in ['mobilenetv3_large', 'mobilenetv3_small']
 
         self.mode = mode
-        self.num_classes = num_classes
-        self.cfg = (coco_config, voc_config)[num_classes == 21]
+        self.cfg = config
         self.priorbox = PriorBox(self.cfg)
         self.priors = self.priorbox.forward()
-        self.size = size
-        self.with_fpn = with_fpn
         # SSD network
-        if self.with_fpn:
-            self.basenet, self.topnet, self.conv_layers, self.fpn_layers, self.loc_layers, self.conf_layers =\
-                self.build_ssd_with_fpn(backbone, self.size, self.num_classes)
+        if self.cfg.with_fpn:
+            self.build_ssd_with_fpn()
         else:
-            self.basenet, self.topnet, self.loc_layers, self.conf_layers =\
-                self.build_ssd(backbone, self.size, self.num_classes)
+            self.build_ssd()
 
-        if mode == 'test':
+        if self.mode == 'test':
             self.softmax = nn.Softmax(dim=-1)
-            self.detect = Detect(num_classes, 0, 200, 0.01, 0.45)
+            self.detect = Detect(self.cfg.num_classes, 0,
+                                 200, 0.01, 0.45, self.cfg.variance)
 
     def forward(self, x):
         """Applies network layers and ops on input image(s) x.
 
         Args:
-            x: input image or batch of images. Shape: [batch,3,256,256].
+            x: input image or batch of images. Shape: [batch,3,512,512].
 
         Return:
             Depending on phase:
@@ -943,17 +882,18 @@ class SSD(nn.Module):
         classify_output = []  # confidence of classification of specific layer
         # number of base layer to get box regression ans confidence
         for num, layer in enumerate(self.basenet):
-            if num in self.cfg['net_source']:
+            if num in self.cfg.net_source:
                 feature_inputs.append(layer.conv._modules['0'](x))
             x = layer(x)
         for num, layer in enumerate(self.topnet):
-            x = layer._modules['0'](x)
-            x = layer._modules['1'](x)
+            # x = layer._modules['0'](x)
+            # x = layer._modules['1'](x)
+            x = layer(x)
             feature_inputs.append(x)
-            x = layer._modules['2'](x)
+            # x = layer._modules['2'](x)
 
         # FPN
-        if self.with_fpn:
+        if self.cfg.with_fpn:
             for idx in range(len(feature_inputs)-1, -1, -1):
                 if idx == len(feature_inputs)-1:
                     x = self.conv_layers[idx](feature_inputs[idx])
@@ -985,12 +925,12 @@ class SSD(nn.Module):
             [conf.view(conf.shape[0], -1) for conf in classify_output], dim=1)
         if self.mode == 'test':
             output = self.detect(loc_reg_output, self.softmax(classify_output.view(
-                classify_output.shape[0], -1, self.num_classes)), self.priors)
+                classify_output.shape[0], -1, self.cfg.num_classes)), self.priors)
         else:
             output = (
                 loc_reg_output,
                 classify_output.view(
-                    classify_output.shape[0], -1, self.num_classes),
+                    classify_output.shape[0], -1, self.cfg.num_classes),
                 self.priors
             )
 
@@ -1006,97 +946,94 @@ class SSD(nn.Module):
         else:
             print('Sorry only .pth and .pkl files supported.')
 
-    def build_ssd_with_fpn(self, backbone, size, num_classes):
-        conv_layers = []
-        fpn_layers = []
-        extra_layers = []
-        loc_layers = []
-        conf_layers = []
-        mobile_layers = []
+    def build_ssd_with_fpn(self):
+        self.basenet = nn.ModuleList([])
+        self.topnet = nn.ModuleList([])
+        self.conv_layers = nn.ModuleList([])
+        self.fpn_layers = nn.ModuleList([])
+        self.loc_layers = nn.ModuleList([])
+        self.conf_layers = nn.ModuleList([])
 
         # build backbone network
-        if backbone == 'mobilenetv3_small':
+        if self.cfg.backbone == 'mobilenetv3_small':
             base_model = mobilenetv3_small(
-                num_classes=num_classes, include_top=False)
-            mobile_layers += base_model.get_layers()
+                num_classes=self.cfg.num_classes, include_top=False)
+            self.basenet += base_model.get_layers()
         else:
             base_model = mobilenetv3_large(
-                num_classes=num_classes, include_top=False)
-            mobile_layers += base_model.get_layers()
+                num_classes=self.cfg.num_classes, include_top=False)
+            self.basenet += base_model.get_layers()
 
         # build extras network on the top of the backbone
         in_channels = 96
-        for k, v in enumerate(self.cfg['extras'][str(size)]):
-            extra_layers.append(nn.Sequential(nn.Conv2d(in_channels, v, kernel_size=1, stride=1),
-                                              nn.Conv2d(v, v, kernel_size=3,
-                                                        stride=2, padding=1, groups=v),
-                                              nn.Conv2d(v, v*2, kernel_size=1, stride=1)))
-            in_channels = v*2
+        block = InvertedResidual
+        for k, v in enumerate(self.cfg.extras):
+            self.topnet.append(block(in_channels, in_channels, v, kernel_size=3,
+                                     stride=2, use_se=True, use_hs=True))
+            # self.topnet.append(nn.Sequential(nn.Conv2d(in_channels, v, kernel_size=1, stride=1),
+            #                                  nn.Conv2d(v, v, kernel_size=3,
+            #                                            stride=2, padding=1, groups=v),
+            #                                  nn.Conv2d(v, v*2, kernel_size=1, stride=1)))
+            in_channels = v
 
         # build fpn and classify/regression layers
-        mbox = self.cfg['mbox'][str(size)]
-        for k, v in enumerate(self.cfg['net_source']):
-            conv_layers += [nn.Conv2d(mobile_layers[v].conv._modules['0'].out_channels,
-                                      self.cfg['TOP_DOWN_PYRAMID_SIZE'], kernel_size=1)]
-            fpn_layers += [nn.Conv2d(self.cfg['TOP_DOWN_PYRAMID_SIZE'],
-                                     self.cfg['TOP_DOWN_PYRAMID_SIZE'],
-                                     kernel_size=3, padding=1)]
-            loc_layers += [nn.Conv2d(self.cfg['TOP_DOWN_PYRAMID_SIZE'],
-                                     mbox[k] * 4, kernel_size=3, padding=1)]
-            conf_layers += [nn.Conv2d(self.cfg['TOP_DOWN_PYRAMID_SIZE'],
-                                      mbox[k] * num_classes, kernel_size=3, padding=1)]
-        for k, v in enumerate(extra_layers, 4):
-            conv_layers += [nn.Conv2d(v._modules['1'].out_channels,
-                                      self.cfg['TOP_DOWN_PYRAMID_SIZE'], kernel_size=1)]
-            # fpn_layers += [nn.Conv2d(self.cfg['TOP_DOWN_PYRAMID_SIZE'],
-            #                          kernel_size=3, padding=1)]
-            loc_layers += [nn.Conv2d(self.cfg['TOP_DOWN_PYRAMID_SIZE'], mbox[k]
-                                     * 4, kernel_size=3, padding=1)]
-            conf_layers += [nn.Conv2d(self.cfg['TOP_DOWN_PYRAMID_SIZE'], mbox[k]
-                                      * num_classes, kernel_size=3, padding=1)]
-        return nn.ModuleList(mobile_layers), nn.ModuleList(extra_layers), \
-            nn.ModuleList(conv_layers), nn.ModuleList(fpn_layers), \
-            nn.ModuleList(loc_layers), nn.ModuleList(conf_layers)
+        mbox = self.cfg.mbox
+        for k, v in enumerate(self.cfg.net_source):
+            self.conv_layers += [nn.Conv2d(self.basenet[v].conv._modules['0'].out_channels,
+                                           self.cfg.top_down_pyramid_size, kernel_size=1)]
+            self.fpn_layers += [nn.Conv2d(self.cfg.top_down_pyramid_size,
+                                          self.cfg.top_down_pyramid_size,
+                                          kernel_size=3, padding=1)]
+            self.loc_layers += [nn.Conv2d(self.cfg.top_down_pyramid_size,
+                                          mbox[k] * 4, kernel_size=3, padding=1)]
+            self.conf_layers += [nn.Conv2d(self.cfg.top_down_pyramid_size,
+                                           mbox[k] * self.cfg.num_classes, kernel_size=3, padding=1)]
+        for k, v in enumerate(self.topnet, 4):
+            # self.conv_layers += [nn.Conv2d(v._modules['1'].out_channels,
+            #                                self.cfg.top_down_pyramid_size, kernel_size=1)]
+            self.conv_layers += [nn.Conv2d(v.out_channels,
+                                           self.cfg.top_down_pyramid_size, kernel_size=1)]
+            self.loc_layers += [nn.Conv2d(self.cfg.top_down_pyramid_size, mbox[k]
+                                          * 4, kernel_size=3, padding=1)]
+            self.conf_layers += [nn.Conv2d(self.cfg.top_down_pyramid_size, mbox[k]
+                                           * self.cfg.num_classes, kernel_size=3, padding=1)]
 
-    def build_ssd(self, backbone, size, num_classes):
-        mobile_layers = []
-        extra_layers = []
-        loc_layers = []
-        conf_layers = []
-
+    def build_ssd(self):
+        self.basenet = nn.ModuleList([])
+        self.topnet = nn.ModuleList([])
+        self.loc_layers = nn.ModuleList([])
+        self.conf_layers = nn.ModuleList([])
         # build backbone network
         if backbone == 'mobilenetv3_small':
             base_model = mobilenetv3_small(
-                num_classes=num_classes, include_top=False)
-            mobile_layers += base_model.get_layers()
+                num_classes=self.cfg.num_classes, include_top=False)
+            self.basenet += base_model.get_layers()
         else:
             base_model = mobilenetv3_large(
-                num_classes=num_classes, include_top=False)
-            mobile_layers += base_model.get_layers()
+                num_classes=self.cfg.num_classes, include_top=False)
+            self.basenet += base_model.get_layers()
 
         # build extras network on the top of the backbone
         in_channels = 96
-        for k, v in enumerate(self.cfg['extras'][str(size)]):
-            extra_layers.append(nn.Sequential(nn.Conv2d(in_channels, v, kernel_size=1, stride=1),
-                                              nn.Conv2d(v, v, kernel_size=3,
-                                                        stride=2, padding=1, groups=v),
-                                              nn.Conv2d(v, v*2, kernel_size=1, stride=1)))
+        for k, v in enumerate(self.cfg.extras):
+            self.topnet.append(nn.Sequential(nn.Conv2d(in_channels, v, kernel_size=1, stride=1),
+                                             nn.Conv2d(v, v, kernel_size=3,
+                                                       stride=2, padding=1, groups=v),
+                                             nn.Conv2d(v, v*2, kernel_size=1, stride=1)))
             in_channels = v*2
 
         # build fpn and classify/regression layers
-        mbox = self.cfg['mbox'][str(size)]
-        for k, v in enumerate(self.cfg['net_source']):
-            loc_layers += [nn.Conv2d(mobile_layers[v].conv._modules['0'].out_channels,
-                                     mbox[k] * 4, kernel_size=3, padding=1)]
-            conf_layers += [nn.Conv2d(mobile_layers[v].conv._modules['0'].out_channels,
-                                      mbox[k] * num_classes, kernel_size=3, padding=1)]
-        for k, v in enumerate(extra_layers, 4):
-            loc_layers += [nn.Conv2d(v._modules['1'].out_channels, mbox[k]
-                                     * 4, kernel_size=3, padding=1)]
-            conf_layers += [nn.Conv2d(v._modules['1'].out_channels, mbox[k]
-                                      * num_classes, kernel_size=3, padding=1)]
-        return nn.ModuleList(mobile_layers), nn.ModuleList(extra_layers), \
-            nn.ModuleList(loc_layers), nn.ModuleList(conf_layers)
+        mbox = self.cfg.mbox
+        for k, v in enumerate(self.cfg.net_source):
+            self.loc_layers += [nn.Conv2d(self.basenet[v].conv._modules['0'].out_channels,
+                                          mbox[k] * 4, kernel_size=3, padding=1)]
+            self.conf_layers += [nn.Conv2d(self.basenet[v].conv._modules['0'].out_channels,
+                                           mbox[k] * self.cfg.num_classes, kernel_size=3, padding=1)]
+        for k, v in enumerate(self.topnet, 4):
+            self.loc_layers += [nn.Conv2d(v._modules['1'].out_channels, mbox[k]
+                                          * 4, kernel_size=3, padding=1)]
+            self.conf_layers += [nn.Conv2d(v._modules['1'].out_channels, mbox[k]
+                                           * self.cfg.num_classes, kernel_size=3, padding=1)]
 
     def to_cuda(self):
         self.priors = self.priors.cuda()
@@ -1502,7 +1439,7 @@ class PhotometricDistort(object):
 
 
 class SSDAugmentation(object):
-    def __init__(self, size=voc_config['min_dim'], mean=MEANS):
+    def __init__(self, size=512, mean=(104, 117, 123)):
         self.mean = mean
         self.size = size
         self.augment = Compose([
@@ -1539,7 +1476,7 @@ class VOCDataset(data.Dataset):
         dataset_dir: dataset directory
         datasets: list with dataset name as 'VOC2007', 'VOC2012'
         include_difficult: whether or not include difficult detect target
-        class_to_ind: dict of class to index map 
+        class_to_ind: dict of class to index map
     """
 
     def __init__(self, dataset_dir, transform=None, mode='train', datasets=['VOC2007', 'VOC2012'],
@@ -1637,7 +1574,7 @@ class MultiBoxLoss(nn.Module):
     """
 
     def __init__(self, num_classes, overlap_thresh, prior_for_matching,
-                 bkg_label, neg_mining, neg_pos, neg_overlap, encode_target, use_gpu=True):
+                 bkg_label, neg_mining, neg_pos, encode_target, variance, use_gpu=True):
         super(MultiBoxLoss, self).__init__()
         self.use_gpu = use_gpu
         self.num_classes = num_classes
@@ -1647,8 +1584,7 @@ class MultiBoxLoss(nn.Module):
         self.use_prior_for_matching = prior_for_matching
         self.do_neg_mining = neg_mining
         self.negpos_ratio = neg_pos
-        self.neg_overlap = neg_overlap
-        self.variance = voc_config['variance']
+        self.variance = variance
 
     def forward(self, predictions, targets):
         """Multibox Loss
@@ -1725,13 +1661,14 @@ def str2bool(v):
 
 
 def xavier(param):
-    init.xavier_uniform(param)
+    init.xavier_uniform_(param)
 
 
 def weights_init(m):
     if isinstance(m, nn.Conv2d):
         xavier(m.weight.data)
-        m.bias.data.zero_()
+        if m.bias is not None:
+            m.bias.data.zero_()
 
 
 def create_vis_plot(_xlabel, _ylabel, _title, _legend):
@@ -1798,38 +1735,49 @@ def adjust_learning_rate(optimizer, lr, gamma, step):
         param_group['lr'] = learning_rate
 
 
-def train(dataset_name, basenet, batch_size, num_workers, cuda, lr, weight_decay,
-          gamma, visdom, save_folder, resume, start_iter, **kwargs):
-    logger = Logger(HOME+'/log', basenet)
-    if dataset_name == 'VOC':
-        cfg = voc_config
-        dataset = VOCDataset(DATA_DIR, transform=SSDAugmentation(
-            cfg['min_dim'], MEANS), keep_difficult=False)
-    elif dataset_name == 'COCO':
-        cfg = coco_config
-        dataset = COCODataset(DATA_DIR, transform=SSDAugmentation(
-            cfg['min_dim'], MEANS))
+class TrainConfig(Config):
+    batch_size = 32
+    resume = None
+    start_iter = 0
+    num_workers = 0
+    cuda = False
+    lr = 1e-3
+    weight_decay = 5e-4
+    gamma = 0.1
+    visdom = False
+    save_folder = './trained'
+    lr_steps = (80000, 100000, 120000)
+    max_iter = 200000
 
-    if visdom:
+
+def train(dataset_name):
+    if dataset_name == 'VOC':
+        cfg = TrainConfig()
+        dataset = VOCDataset(DATA_DIR, transform=SSDAugmentation(
+            cfg.min_dim, cfg.means), keep_difficult=False)
+    elif dataset_name == 'COCO':
+        cfg = CocoConfig()
+        dataset = COCODataset(DATA_DIR, transform=SSDAugmentation(
+            cfg.min_dim, cfg.means))
+    cfg.display()
+    if cfg.visdom:
         import visdom
         viz = visdom.Visdom()
 
-    ssd_net = SSD('train', basenet,
-                  cfg['min_dim'], cfg['num_classes'], with_fpn=True)
+    ssd_net = SSD('train', cfg)
     net = ssd_net
-    if cuda:
+    if cfg.cuda:
         net = nn.DataParallel(ssd_net)
         cudnn.benchmark = True
 
-    if start_iter == 0:
+    logger = Logger(cfg.save_folder, cfg.name+'_'+cfg.backbone)
+    if cfg.start_iter == 0:
         # 加载mobilenet预学习权重
         logger('Loading mobilenetv3_small.pth ...')
-        # torchvision.datasets.utils.download_url('https://github.com/guijiyang/mobilenetv3.pytorch/releases/download/v.1.0.0/mobilenetv3-small-c7eb32fe.pth',
-        #                                         root='./', filename='mobilenetv3_small.pth', md5='1e377a0bff1ba60edc998529a073aca2')
-        # load_weights = torch.load(
-        #     './mobilenetv3_small.pth', map_location=lambda storage, loc: storage)
-        load_weights = torch.load(
-            './pretrained/mobilenetv3-small-c7eb32fe.pth')
+        torchvision.datasets.utils.download_url('https://github.com/guijiyang/mobilenetv3.pytorch/releases/download/v.1.0.0/mobilenetv3-small-c7eb32fe.pth',
+                                                root=cfg.save_folder, filename='mobilenetv3-small-c7eb32fe.pth', md5='1e377a0bff1ba60edc998529a073aca2')
+        load_weights = torch.load(os.path.join(cfg.save_folder, 'mobilenetv3-small-c7eb32fe.pth'),
+                                  map_location=lambda storage, loc: storage)
         pop_weights = [
             'conv.0.0.weight',
             'conv.0.1.weight',
@@ -1852,25 +1800,28 @@ def train(dataset_name, basenet, batch_size, num_workers, cuda, lr, weight_decay
             load_weights.pop(weight)
         ssd_net.load_state_dict(load_weights, False)
 
-    if resume:
-        logger('Loading {} ...'.format(resume))
+    if cfg.resume:
+        logger('Loading {} ...'.format(cfg.resume))
         # torchvision.datasets.utils.download_url('https://github.com/guijiyang/mobilenetv3.pytorch/releases/download/v.1.0.0/ssd224_VOC_60000.pth',
         #                                         root='./', filename=resume, md5='850ec8b383e0d8fc8001293df58e5183')
-        load_weights = torch.load(
-            resume, map_location=lambda storage, loc: storage)
+        load_weights = torch.load(os.path.join(cfg.save_folder, cfg.resume),
+                                  map_location=lambda storage, loc: storage)
         # print(load_weights)
         ssd_net.load_state_dict(load_weights, True)
-    if cuda:
+    if cfg.cuda:
         net = net.cuda()
-    if not resume:
+    if not cfg.resume:
         logger('Initializing weights ...')
         ssd_net.topnet.apply(weights_init)
+        ssd_net.conv_layers.apply(weights_init)
+        ssd_net.fpn_layers.apply(weights_init)
         ssd_net.loc_layers.apply(weights_init)
         ssd_net.conf_layers.apply(weights_init)
 
-    optimizer = optim.Adam(net.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = MultiBoxLoss(cfg['num_classes'], 0.5, True, 0, True, 3, 0.5,
-                             False, cuda)
+    optimizer = optim.Adam(net.parameters(), lr=cfg.lr,
+                           weight_decay=cfg.weight_decay)
+    criterion = MultiBoxLoss(cfg.num_classes, cfg.overlap_threshold, True, 0, True, cfg.negative_ratio,
+                             False, cfg.variance, cfg.cuda)
 
     net.train()
     # loss counters
@@ -1879,27 +1830,27 @@ def train(dataset_name, basenet, batch_size, num_workers, cuda, lr, weight_decay
     epoch = 0
     logger('Loading the dataset...')
 
-    epoch_size = len(dataset) // batch_size
-    logger('Training SSD on:{}'.format(dataset.name))
+    epoch_size = len(dataset) // cfg.batch_size
+    logger('Training SSD on:{}'.format(cfg.name))
     # logger('using the specified args:')
 
     step_index = 0
 
-    if visdom:
-        vis_title = 'SSD.PyTorch on ' + dataset.name
+    if cfg.visdom:
+        vis_title = 'SSD.PyTorch on ' + cfg.name
         vis_legend = ['Loc Loss', 'Conf Loss', 'Total Loss']
         iter_plot = create_vis_plot('Iteration', 'Loss', vis_title, vis_legend)
         epoch_plot = create_vis_plot('Epoch', 'Loss', vis_title, vis_legend)
 
-    data_loader = data.DataLoader(dataset, batch_size,
+    data_loader = data.DataLoader(dataset, cfg.batch_size,
                                   #   num_workers=num_workers,
                                   shuffle=True, collate_fn=detection_collate,
                                   pin_memory=True)
     # create batch iterator
     batch_iterator = iter(data_loader)
     t0 = time.time()
-    for iteration in range(start_iter, cfg['max_iter']):
-        if visdom and iteration != 0 and (iteration % epoch_size == 0):
+    for iteration in range(cfg.start_iter, cfg.max_iter):
+        if cfg.visdom and iteration != 0 and (iteration % epoch_size == 0):
             update_vis_plot(epoch, loc_loss.item(), conf_loss.item(), epoch_plot, None,
                             'append', epoch_size)
             logger('epoch = {} : loss = {}, loc_loss = {}, conf_loss = {}'.format(
@@ -1909,9 +1860,9 @@ def train(dataset_name, basenet, batch_size, num_workers, cuda, lr, weight_decay
             conf_loss = 0
             epoch += 1
 
-        if iteration in cfg['lr_steps']:
+        if iteration in cfg.lr_steps:
             step_index += 1
-            adjust_learning_rate(optimizer, lr, gamma, step_index)
+            adjust_learning_rate(optimizer, cfg.lr, cfg.gamma, step_index)
 
         # load train data
         images, targets = next(batch_iterator)
@@ -1920,12 +1871,9 @@ def train(dataset_name, basenet, batch_size, num_workers, cuda, lr, weight_decay
             batch_iterator = iter(data_loader)
             print(iteration)
 
-        if cuda:
+        if cfg.cuda:
             images = images.cuda()
             targets = [ann.cuda()for ann in targets]
-        # else:
-        #     images=torch.tensor(images)
-        #     targets=torch.tensor(targets)
         # forward
         # backprop
         optimizer.zero_grad()
@@ -1935,11 +1883,11 @@ def train(dataset_name, basenet, batch_size, num_workers, cuda, lr, weight_decay
         loss.backward()
         optimizer.step()
 
-        if visdom:
+        if cfg.visdom:
             loc_loss += loss_l.item()
             conf_loss += loss_c.item()
 
-        if iteration % 50 == 0 and iteration > start_iter:
+        if iteration % 50 == 0 and iteration > cfg.start_iter:
             t1 = time.time()
             logger('timer: %.4f sec. || ' % (t1 - t0)+'iter ' + repr(iteration) +
                    ' || Loss: %.4f ||' % (loss.item()) +
@@ -1947,49 +1895,38 @@ def train(dataset_name, basenet, batch_size, num_workers, cuda, lr, weight_decay
                    ' || conf_loss: %.4f ||' % (loss_c.item()))
             t0 = time.time()
 
-        if visdom:
+        if cfg.visdom:
             update_vis_plot(iteration, loss_l.item(), loss_c.item(),
                             iter_plot, epoch_plot, 'append')
 
         if iteration != 0 and iteration % 5000 == 0:
             logger('Saving state, iter:%d' % iteration)
-            torch.save(ssd_net.state_dict(), save_folder+'ssd224_VOC_' +
-                       repr(iteration) + '.pth')
+            torch.save(ssd_net.state_dict(), os.path.join(save_folder, 'SSD'+str(cfg.min_dim)+'_VOC_' +
+                                                          repr(iteration) + '.pth'))
     torch.save(ssd_net.state_dict(),
-               save_folder + 'ssd224_VOC.pth')
+               os.path.join(save_folder, 'SSD'+str(cfg.min_dim)+'_VOC.pth'))
 
 
 # %%
 if __name__ == "__main__":
-
     # 这部分代码用于训练
-    args = {}
-    args['dataset_name'] = 'VOC'
-    args['basenet'] = 'mobilenetv3_small'
-    args['batch_size'] = 32
-    # args['resume'] = './pretrained/ssd224_VOC_60000.pth'
-    # args['start_iter'] = int(re.findall(
-    #     r'[1-9]\d+\.?[0-9]\d*', args['resume'])[-1])
-    args['resume'] = None
-    args['start_iter'] = 0
-    args['num_workers'] = 4
-    args['cuda'] = False
-    args['lr'] = 1e-3
-    args['weight_decay'] = 5e-4
-    args['gamma'] = 0.1
-    args['visdom'] = False
-    args['save_folder'] = './trained'
+    # train('VOC')
 
-    train(**args)
-
-    # #　训练结束后测试效果
+    #　训练结束后测试效果
+    # voc_config = Config()
     # dataset = VOCDataset(DATA_DIR, Compose([ConvertFromInts(), Resize(
-    #     voc_config['min_dim']), SubtractMeans(MEANS)]))
-    # idx = np.random.randint(len(dataset))
+    #     voc_config.min_dim), SubtractMeans(voc_config.means)]))
+    # # idx=np.random.randint(len(dataset))
+    # idx = 8137
     # image_id, image, gt_bboxes, width, height = dataset.get_data(idx)
-    # model = SSD('test', 'mobilenetv3_small',
-    #             voc_config['min_dim'], voc_config['num_classes'])
-    # model.load_weights('./pretrained/ssd224_VOC_60000.pth')
+    # gt_bboxes[:, 0] *= width
+    # gt_bboxes[:, 2] *= width
+    # gt_bboxes[:, 1] *= height
+    # gt_bboxes[:, 3] *= height
+    # print(gt_bboxes)
+    # model = SSD('test', voc_config)
+    # # torchsummary.summary(model, (3,512,512), device='cpu')
+    # model.load_weights('./trained/ssd_VOC_35000.pth')
     # model = model.to_cuda()
     # model.eval()
     # with torch.no_grad():
@@ -2013,45 +1950,18 @@ if __name__ == "__main__":
     #                                                          copy=False)
     #     print(cls_dets.shape)
 
-    # voc_config = {
-    #     'num_classes': 21,
-    #     'lr_steps': (80000, 100000, 120000),
-    #     'max_iter': 120000,
-    #     'feature_maps': [38, 19, 10, 5, 3, 1],
-    #     'steps': [8, 16, 32, 64, 100, 300],
-    #     'min_sizes': [30, 60, 111, 162, 213, 264],
-    #     'max_sizes': [60, 111, 162, 213, 264, 315],
-    #     'min_dim': 300,
-    #     'aspect_ratios': {
-    #         '300': [[2], [2, 3], [2, 3], [2, 3], [2], [2]],
-    #     },
-    #     # 'ratios': [0.33, 0.5, 1, 2, 3],
-    #     'variance': [0.1, 0.2],
-    #     'clip': True,
-    #     'name': 'VOC',
-    #     'TOP_DOWN_PYRAMID_SIZE': 256,
-    #     'extras': {
-    #         '300': [256, 128, 128],
-    #     },
-    #     'net_source': [1, 3, 7, 11],
-    #     'mbox': {
-    #         # number of boxes per feature map location
-    #         '300': [4, 6, 6, 6, 4, 4],
-    #     }
-    # }
-
     # dataset = VOCDataset(DATA_DIR, Compose([ConvertFromInts(), Resize(
-    #     voc_config['min_dim']), SubtractMeans(MEANS)]), keep_difficult=False)
+    #     voc_config.min_dim), SubtractMeans(cfg.means)]), keep_difficult=False)
 
-    dataset = VOCDataset(DATA_DIR, transform=SSDAugmentation(
-        voc_config['min_dim'], MEANS), keep_difficult=False)
-    data_loader = data.DataLoader(
-        dataset, 32, shuffle=True, collate_fn=detection_collate, pin_memory=True)
-    model = SSD('test', 'mobilenetv3_small',
-                voc_config['min_dim'], voc_config['num_classes'])
-    batch_iterator = iter(data_loader)
-    priorbox = PriorBox(voc_config)
-    priors = priorbox.forward()
+    # dataset = VOCDataset(DATA_DIR, transform=SSDAugmentation(
+    #     voc_config.min_dim, cfg.means), keep_difficult=False)
+    # data_loader = data.DataLoader(
+    #     dataset, 32, shuffle=True, collate_fn=detection_collate, pin_memory=True)
+    # model = SSD('test', 'mobilenetv3_small',
+    #             voc_config.min_dim, voc_config.num_classes)
+    # batch_iterator = iter(data_loader)
+    # priorbox = PriorBox(voc_config)
+    # priors = priorbox.forward()
     # num=5
     # num_priors = (priors.size(0))
     # loc_t = torch.Tensor(num, num_priors, 4)
@@ -2067,50 +1977,44 @@ if __name__ == "__main__":
     #     labels = torch.from_numpy(targets[:, -1]).float()
     #     defaults = priors.data
     #     match(0.5, truths, defaults,
-    #             voc_config['variance'], labels, loc_t, conf_t, idx)
+    #             voc_config.variance, labels, loc_t, conf_t, idx)
 
     # pos = conf_t > 0
     # num_pos = pos.sum(dim=1, keepdim=True)
     # print(num_pos)
     # match priors (default boxes) and ground truth boxes
-    num = 32
-    num_priors = (priors.size(0))
-    loc_t = torch.Tensor(num, num_priors, 4)
-    conf_t = torch.LongTensor(num, num_priors)
-    total = 0
-    sizes = np.array([]).reshape(-1, 2)
-    for iteration in range(1, 50):
-        images, targets = next(batch_iterator)
-        for idx in range(num):
-            truths = targets[idx][:, :-1].data
-            labels = targets[idx][:, -1].data
-            defaults = priors.data
-            match(0.5, truths, defaults,
-                  voc_config['variance'], labels, loc_t, conf_t, idx)
+#     num = 32
+#     num_priors = (priors.size(0))
+#     loc_t = torch.Tensor(num, num_priors, 4)
+#     conf_t = torch.LongTensor(num, num_priors)
+#     total = 0
+#     sizes = np.array([]).reshape(-1, 2)
+#     for iteration in range(1, 50):
+#         images, targets = next(batch_iterator)
+#         for idx in range(num):
+#             truths = targets[idx][:, :-1].data
+#             labels = targets[idx][:, -1].data
+#             defaults = priors.data
+#             match(0.5, truths, defaults,
+#                   voc_config.variance, labels, loc_t, conf_t, idx)
 
-        pos = conf_t > 0
-        num_pos = pos.sum(dim=1, keepdim=True)
-        p = num_pos == 1
-        idx = np.nonzero(p)
-        for i in idx:
-            box = targets[i[0]]
-            size = (box[:, 2:4]-box[:, :2])*voc_config['min_dim']
-            sizes = np.concatenate(
-                [sizes, size.numpy().reshape(-1, 2)], axis=0)
-            # print(size)
-        # poor=targets[idx[:,0].item()]
-        total += p.sum()
-    print(total)
-    # print(sizes)
-    # sizes=np.array(sizes).reshape(-1,2)
-    print(sizes.sum(axis=0)/sizes.shape[0])
+#         pos = conf_t > 0
+#         num_pos = pos.sum(dim=1, keepdim=True)
+#         p = num_pos == 1
+#         idx = np.nonzero(p)
+#         for i in idx:
+#             box = targets[i[0]]
+#             size = (box[:, 2:4]-box[:, :2])*voc_config.min_dim
+#             sizes = np.concatenate(
+#                 [sizes, size.numpy().reshape(-1, 2)], axis=0)
+#             # print(size)
+#         # poor=targets[idx[:,0].item()]
+#         total += p.sum()
+#     print(total)
+#     # print(sizes)
+#     # sizes=np.array(sizes).reshape(-1,2)
+#     print(sizes.sum(axis=0)/sizes.shape[0])
 
-# %%
-    fig = plt.figure(figsize=(16, 16))
-    plt.scatter(sizes[:, 0], sizes[:, 1])
-
-# %%
-sizes.shape
-
-
-#%%
+# # %%
+#     fig = plt.figure(figsize=(16, 16))
+#     plt.scatter(sizes[:, 0], sizes[:, 1])
